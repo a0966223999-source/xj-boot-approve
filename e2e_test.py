@@ -202,16 +202,23 @@ with sync_playwright() as pw:
 
     # 11. a passkey that was never registered
     cdp.send("WebAuthn.removeVirtualAuthenticator", {"authenticatorId": auth})
-    cdp.send("WebAuthn.addVirtualAuthenticator", {"options": {
+    cdp_auth = [None]
+    cdp_auth[0] = cdp.send("WebAuthn.addVirtualAuthenticator", {"options": {
         "protocol": "ctap2", "transport": "internal", "hasResidentKey": True,
-        "hasUserVerification": True, "isUserVerified": True, "automaticPresenceSimulation": True}})
+        "hasUserVerification": True, "isUserVerified": True, "automaticPresenceSimulation": True}})["authenticatorId"]
     register()  # created but NOT added to trusted keys
     rq7 = xj("request"); n7 = rq7["nonce"]; approve(rq7["url"])
     check("unregistered passkey -> deny", xj("start", "--nonce", n7, "--wait", "5").get("reason"), "UNKNOWN_KEY")
 
     # 12. expired approval
     rq8 = xj("request", "--ttl", "30"); n8 = rq8["nonce"]
-    # re-register the original key? not needed: expiry check happens after signature, so use a fresh trusted key
+    # fresh authenticator holding only one, newly trusted key
+    for a in cdp.send("WebAuthn.getCredentials", {"authenticatorId": cdp_auth[0]})["credentials"]:
+        pass
+    cdp.send("WebAuthn.removeVirtualAuthenticator", {"authenticatorId": cdp_auth[0]})
+    cdp_auth[0] = cdp.send("WebAuthn.addVirtualAuthenticator", {"options": {
+        "protocol": "ctap2", "transport": "internal", "hasResidentKey": True,
+        "hasUserVerification": True, "isUserVerified": True, "automaticPresenceSimulation": True}})["authenticatorId"]
     reg2 = register(); open(regf, "w").write(reg2); xj("add-key", regf)
     approve(rq8["url"])
     print("   waiting 31s for expiry…", flush=True); time.sleep(31)
@@ -221,6 +228,20 @@ with sync_playwright() as pw:
     page.goto("about:blank")
     page.goto(f"{ORIGIN}/index.html#a=eGotYm9vdA&r={ORIGIN}/relay")
     check("page rejects malformed link", page.is_visible("#invalid"), True)
+
+    # 14-17 standing (long-term) approval through the real page
+    xj("stop", "--grace", "3"); xj("clear-stop")
+    rqs = xj("request", "--standing-days", "30"); ns = rqs["nonce"]
+    page.goto("about:blank"); page.goto(rqs["url"])
+    check("page shows long-term banner", page.is_visible("#standing-banner") and page.is_visible("#f-until"), True)
+    check("page title says long-term", page.text_content("#approve h1"), "批准長期授權")
+    page.click("#btn-approve")
+    page.wait_for_function("document.getElementById('approve-msg').textContent.includes('已批准')", timeout=15000)
+    st = xj("start", "--nonce", ns, "--wait", "10")
+    check("standing approval via real WebAuthn -> PASS", (st["result"], st.get("mode")), ("PASS", "standing"))
+    xj("stop", "--grace", "3"); xj("clear-stop")
+    check("restart under standing grant -> PASS", xj("start", "--standing")["result"], "PASS")
+    xj("stop", "--grace", "3")
 
     browser.close()
 

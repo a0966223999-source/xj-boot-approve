@@ -31,6 +31,7 @@
   textarea { width:100%; min-height:140px; font:12px ui-monospace, Menlo, monospace; padding:8px;
              border:1px solid var(--line); border-radius:8px; background:var(--bg); color:var(--ink); }
   .hidden { display:none; }
+  .standing { border-color:#c47f00; background:color-mix(in srgb, #c47f00 12%, var(--card)); font-size:15px; }
 </style>
 </head>
 <body>
@@ -38,10 +39,15 @@
   <section id="approve" class="hidden">
     <h1>批准 Gateway 啟動</h1>
     <p class="sub">確認下面的主機和版本是你要啟動的，再按指紋。</p>
+    <div id="standing-banner" class="card standing hidden">
+      <strong>長期授權</strong>：按一次指紋後，這台主機的這個版本在
+      <span id="f-days"></span> 天內可重複啟動，不再詢問；程式一改動即失效，可隨時收回。
+    </div>
     <div class="card">
       <dl>
         <dt>主機</dt><dd id="f-host" class="big"></dd>
-        <dt>到期</dt><dd id="f-exp" class="big"></dd>
+        <dt id="l-until" class="hidden">有效至</dt><dd id="f-until" class="big hidden"></dd>
+        <dt id="l-exp">到期</dt><dd id="f-exp" class="big"></dd>
         <dt>版本</dt><dd id="f-man"></dd>
         <dt>編號</dt><dd id="f-nonce"></dd>
       </dl>
@@ -85,6 +91,8 @@ const setMsg = (id, text, cls) => { const el = $(id); el.textContent = text; el.
 
 // Approval text must match the launcher's exact canonical format.
 const LINE_RE = /^xj-boot-approval v1\nhost=([A-Za-z0-9._-]{1,64})\nmanifest_sha256=([0-9a-f]{64})\nnonce=([0-9a-f]{32})\nexpires_unix=([0-9]{10})\n$/;
+const LINE_RE_V2 = /^xj-boot-approval v2\nmode=standing\nhost=([A-Za-z0-9._-]{1,64})\nmanifest_sha256=([0-9a-f]{64})\nnonce=([0-9a-f]{32})\nsign_by_unix=([0-9]{10})\ngrant_until_unix=([0-9]{10})\n$/;
+const fmt = d => d.toLocaleString("zh-TW", { hour12: false });
 
 function parseFragment() {
   const p = new URLSearchParams(location.hash.slice(1));
@@ -92,20 +100,34 @@ function parseFragment() {
 }
 
 async function approveFlow(aParam, relay) {
-  let bytes, text, m;
+  let bytes, text, m, m2;
   try {
     bytes = b64u.dec(aParam);
     text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
     m = LINE_RE.exec(text);
-  } catch (e) { m = null; }
-  if (!m) { $("invalid-why").textContent = "批准內容格式不對，請不要按指紋。"; show("invalid"); return; }
+    m2 = m ? null : LINE_RE_V2.exec(text);
+  } catch (e) { m = null; m2 = null; }
+  if (!m && !m2) { $("invalid-why").textContent = "批准內容格式不對，請不要按指紋。"; show("invalid"); return; }
   if (!relay || !/^https:\/\/|^http:\/\/localhost[:/]/.test(relay)) {
     $("invalid-why").textContent = "缺少回傳位址。"; show("invalid"); return;
   }
-  const [, host, manifest, nonce, expires] = m;
+  let host, manifest, nonce, expires;
+  if (m) {
+    [, host, manifest, nonce, expires] = m;
+  } else {
+    let until;
+    [, host, manifest, nonce, expires, until] = m2;
+    const untilD = new Date(Number(until) * 1000);
+    document.querySelector("#approve h1").textContent = "批准長期授權";
+    $("f-days").textContent = String(Math.round((Number(until) - Number(expires)) / 86400) || 1);
+    $("f-until").textContent = fmt(untilD);
+    ["standing-banner", "l-until", "f-until"].forEach(show);
+    $("l-exp").textContent = "按指紋期限";
+    $("btn-approve").textContent = "用指紋批准長期授權";
+  }
   const exp = new Date(Number(expires) * 1000);
   $("f-host").textContent = host;
-  $("f-exp").textContent = exp.toLocaleString("zh-TW", { hour12: false });
+  $("f-exp").textContent = fmt(exp);
   $("f-man").textContent = manifest;
   $("f-nonce").textContent = nonce;
   show("approve");

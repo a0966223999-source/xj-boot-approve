@@ -8,7 +8,7 @@ and a one-bit change to it must be refused as BAD_SIGNATURE.
 
 Usage: python3 -I host_test.py /path/to/dir/with/xjboot.py
 """
-import base64, hashlib, json, os, secrets, shutil, struct, subprocess, sys, tempfile, time
+import base64, hashlib, json, os, re, secrets, shutil, struct, subprocess, sys, tempfile, time
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -198,6 +198,114 @@ with open(os.path.join(cfg["state_dir"], "pending", rn), "wb") as f:
 check("real Samsung signature verifies (then EXPIRED)", start_with(real["payload"], rn).get("reason"), "EXPIRED")
 rb = dict(real["payload"]); s = bytearray(unb64u(rb["signature"])); s[-1] ^= 1; rb["signature"] = b64u(bytes(s))
 check("real Samsung signature, 1 bit changed -> deny", start_with(rb, rn).get("reason"), "BAD_SIGNATURE")
+
+# ---------------------------------------------------------------- v2 standing grant
+print("--- standing (long-term) approval ---", flush=True)
+reset()
+GRANT = os.path.join(cfg["state_dir"], "standing_grant.json")
+
+
+def standing_request(days=30):
+    r = xj("request", "--standing-days", str(days))
+    n = r["nonce"]
+    return n, open(os.path.join(cfg["state_dir"], "pending", n), "rb").read()
+
+
+def crafted_pending(sign_by, grant_until):
+    n = secrets.token_hex(16)
+    text = ("xj-boot-approval v2\nmode=standing\nhost=%s\nmanifest_sha256=%s\nnonce=%s\n"
+            "sign_by_unix=%d\ngrant_until_unix=%d\n" % (
+                cfg["host"], hashlib.sha256(open(manifest, "rb").read()).hexdigest(), n,
+                sign_by, grant_until)).encode()
+    with open(os.path.join(cfg["state_dir"], "pending", n), "wb") as f:
+        f.write(text)
+    return n, text
+
+
+def start_standing():
+    return xj("start", "--standing")
+
+
+check("no grant yet -> standing start denied", start_standing().get("reason"), "NO_STANDING_GRANT")
+s1, st1 = standing_request(30)
+check("standing approval without fingerprint (UV=0) -> deny",
+      start_with(owner.assertion(st1, s1, uv=False), s1).get("reason"), "USER_NOT_VERIFIED")
+r = start_with(owner.assertion(st1, s1), s1)
+check("standing approval: first start PASS", (r["result"], r.get("mode")), ("PASS", "standing"))
+stt = xj("status")["standing_grant"] or {}
+check("status shows active standing grant", (stt.get("active"), stt.get("nonce")), (True, s1))
+check("standing start while running -> deny", start_standing().get("reason"), "ALREADY_RUNNING")
+reset()
+r = start_standing()
+check("restart under standing grant, no new fingerprint -> PASS", r["result"], "PASS")
+xj("stop", "--grace", "3")
+check("STOP present -> standing start denied", start_standing().get("reason"), "STOP_PRESENT")
+xj("clear-stop")
+r = start_standing(); reset()
+check("restart again after clear-stop -> PASS", r["result"], "PASS")
+check("standing approval nonce cannot be claimed twice",
+      start_with(owner.assertion(st1, s1), s1).get("reason"), "REPLAY")
+
+with open(manifest, "w") as f:
+    f.write("gateway build 3 (code changed)\n")
+check("code changed -> standing grant void", start_standing().get("reason"), "MANIFEST_CHANGED")
+with open(manifest, "w") as f:
+    f.write("gateway build 1\n")
+check("standing grant on another host -> deny",
+      xj("start", "--standing", cfgpath=CFG_B).get("reason"), "HOST_MISMATCH")
+
+good_grant = open(GRANT).read()
+g = json.loads(good_grant); sb = bytearray(unb64u(g["payload"]["signature"])); sb[-1] ^= 1
+g["payload"]["signature"] = b64u(bytes(sb)); open(GRANT, "w").write(json.dumps(g))
+check("grant file with altered signature -> deny", start_standing().get("reason"), "BAD_SIGNATURE")
+g = json.loads(good_grant)
+longer = re.sub(rb"grant_until_unix=\d+\n", b"grant_until_unix=4102444800\n", unb64u(g["approval_b64"]))
+g["approval_b64"] = b64u(longer); g["payload"]["approval"] = b64u(longer)
+open(GRANT, "w").write(json.dumps(g))
+check("grant file with extended expiry -> deny", start_standing().get("reason"), "CHALLENGE_MISMATCH")
+open(GRANT, "w").write(good_grant)
+check("original grant file restored -> PASS", start_standing()["result"], "PASS")
+reset()
+
+rv = xj("revoke")
+check("revoke removes grant", (rv["result"], rv.get("had_grant")), ("REVOKED", True))
+check("after revoke -> standing start denied", start_standing().get("reason"), "NO_STANDING_GRANT")
+open(GRANT, "w").write(good_grant)
+check("restoring a revoked grant file -> deny", start_standing().get("reason"), "GRANT_REVOKED")
+os.unlink(GRANT)
+
+s2, st2 = standing_request(7)
+r = start_with(owner.assertion(st2, s2), s2); reset()
+check("new standing approval after revoke -> PASS", r["result"], "PASS")
+grant2 = open(GRANT).read()
+s3, st3 = standing_request(7)
+r = start_with(owner.assertion(st3, s3), s3); reset()
+check("newer standing approval replaces older -> PASS", r["result"], "PASS")
+open(GRANT, "w").write(grant2)
+check("superseded older grant restored -> deny", start_standing().get("reason"), "GRANT_REVOKED")
+xj("revoke")
+
+n7, t7 = crafted_pending(int(time.time()) + 300, int(time.time()) + 300)
+p7 = owner.assertion(t7, n7)
+fake = {"v": 1, "created_at": time.time(), "approval_b64": b64u(t7), "payload": p7, "nonce": n7}
+open(GRANT, "w").write(json.dumps(fake))
+check("signed but never-claimed approval planted as grant -> deny", start_standing().get("reason"), "GRANT_NOT_CLAIMED")
+os.unlink(GRANT)
+
+n8, t8 = crafted_pending(int(time.time()) + 300, int(time.time()) + 60 * 86400)
+check("standing approval longer than 30 days -> deny",
+      start_with(owner.assertion(t8, n8), n8).get("reason"), "GRANT_TOO_LONG")
+try:
+    os.unlink(os.path.join(cfg["state_dir"], "used", n8))
+except FileNotFoundError:
+    pass
+check("request refuses >30 days", xj("request", "--standing-days", "31")["result"], "CRASH")
+
+n9, t9 = crafted_pending(int(time.time()) + 30, int(time.time()) + 38)
+r = start_with(owner.assertion(t9, n9), n9); reset()
+check("short standing grant: first start PASS", r["result"], "PASS")
+print("   waiting 40s for standing grant expiry…", flush=True); time.sleep(40)
+check("standing grant expired -> deny", start_standing().get("reason"), "STANDING_EXPIRED")
 
 xj("stop", "--grace", "3")
 shutil.rmtree(WORK, ignore_errors=True)
