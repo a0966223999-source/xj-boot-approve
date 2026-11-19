@@ -215,7 +215,7 @@ def crafted_pending(sign_by, grant_until):
     n = secrets.token_hex(16)
     text = ("xj-boot-approval v2\nmode=standing\nhost=%s\nmanifest_sha256=%s\nnonce=%s\n"
             "sign_by_unix=%d\ngrant_until_unix=%d\n" % (
-                cfg["host"], hashlib.sha256(open(manifest, "rb").read()).hexdigest(), n,
+                cfg["host"], hashlib.sha256(open(manifest, "rb").read() + b"\x00start_cmd=" + json.dumps(cfg["start_cmd"], separators=(",", ":"), ensure_ascii=False).encode()).hexdigest(), n,
                 sign_by, grant_until)).encode()
     with open(os.path.join(cfg["state_dir"], "pending", n), "wb") as f:
         f.write(text)
@@ -251,6 +251,10 @@ with open(manifest, "w") as f:
 check("code changed -> standing grant void", start_standing().get("reason"), "MANIFEST_CHANGED")
 with open(manifest, "w") as f:
     f.write("gateway build 1\n")
+CFG_C = os.path.join(WORK, "c.json")
+json.dump(dict(cfg, start_cmd=[sys.executable, "-c", "print('swapped program')"]), open(CFG_C, "w"))
+check("start command changed -> standing grant void",
+      xj("start", "--standing", cfgpath=CFG_C).get("reason"), "MANIFEST_CHANGED")
 check("standing grant on another host -> deny",
       xj("start", "--standing", cfgpath=CFG_B).get("reason"), "HOST_MISMATCH")
 

@@ -87,6 +87,18 @@ def sha256_file(path):
     return h.hexdigest()
 
 
+def binding_sha256(cfg):
+    """What the Owner approves as 'version': the manifest file bytes plus the exact start command.
+    Changing either the code listed in the manifest or the command line voids the approval."""
+    h = hashlib.sha256()
+    with open(cfg["manifest_path"], "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 16), b""):
+            h.update(chunk)
+    h.update(b"\x00start_cmd=" + json.dumps(cfg["start_cmd"], separators=(",", ":"),
+                                            ensure_ascii=False).encode())
+    return h.hexdigest()
+
+
 def fsync_dir(path):
     fd = os.open(path, os.O_RDONLY)
     try:
@@ -169,7 +181,7 @@ def cmd_request(cfg, ttl, standing_days=None):
         raise SystemExit(f"ttl must be 30..{cfg['max_ttl_seconds']}")
     nonce = secrets.token_hex(16)
     now = int(time.time())
-    manifest = sha256_file(cfg["manifest_path"])
+    manifest = binding_sha256(cfg)
     if standing_days is None:
         text = (
             "xj-boot-approval v1\n"
@@ -364,7 +376,7 @@ def cmd_start(cfg, nonce, assertion_file, wait):
 def check_binding(cfg, fields):
     if fields["host"] != cfg["host"]:
         raise Deny("HOST_MISMATCH")
-    if fields["manifest_sha256"] != sha256_file(cfg["manifest_path"]):
+    if fields["manifest_sha256"] != binding_sha256(cfg):
         raise Deny("MANIFEST_CHANGED")
 
 
