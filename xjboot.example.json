@@ -1,0 +1,14 @@
+{
+  "rp_id": "<你的批准頁網域，例如 xxx.github.io>",
+  "origin": "https://<同上>",
+  "host": "gateway",
+  "manifest_path": "/path/to/release/MANIFEST",
+  "start_cmd": ["/path/to/start-gateway.sh"],
+  "state_dir": "/var/lib/xj-boot",
+  "trusted_keys": "/etc/xj-boot/trusted_keys.json",
+  "page_url": "https://<同上>/",
+  "relay_post": "https://ntfy.sh/<隨機長名稱-回傳>",
+  "relay_poll": "https://ntfy.sh/<隨機長名稱-回傳>/json?poll=1&since=15m",
+  "notify_url": "https://ntfy.sh/<隨機長名稱-通知>",
+  "max_ttl_seconds": 600
+}
