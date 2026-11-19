@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>XJ Boot 批准</title>
+<style>
+  :root { --bg:#f6f5f2; --card:#fff; --ink:#1c1b19; --muted:#6b6862; --line:#e3e0da;
+          --ok:#1f7a4d; --bad:#b3261e; --btn:#1c1b19; --btn-ink:#fff; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#151514; --card:#1f1e1c; --ink:#ecebe7; --muted:#a19e97; --line:#34322e;
+            --ok:#5fc48f; --bad:#f2827a; --btn:#ecebe7; --btn-ink:#151514; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+         font:16px/1.5 system-ui, -apple-system, "Noto Sans TC", sans-serif; }
+  main { max-width:520px; margin:0 auto; padding:24px 16px 48px; }
+  h1 { font-size:20px; margin:0 0 4px; }
+  .sub { color:var(--muted); margin:0 0 20px; font-size:14px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:16px; margin-bottom:16px; }
+  dl { display:grid; grid-template-columns:auto 1fr; gap:8px 12px; margin:0; }
+  dt { color:var(--muted); font-size:14px; }
+  dd { margin:0; font-family:ui-monospace, Menlo, monospace; font-size:14px; word-break:break-all; }
+  dd.big { font-family:inherit; font-size:18px; font-weight:600; }
+  button { width:100%; padding:14px; border:0; border-radius:12px; background:var(--btn); color:var(--btn-ink);
+           font-size:17px; font-weight:600; cursor:pointer; }
+  button:disabled { opacity:.4; cursor:default; }
+  .msg { margin-top:12px; font-size:15px; min-height:1.5em; }
+  .ok { color:var(--ok); } .bad { color:var(--bad); }
+  textarea { width:100%; min-height:140px; font:12px ui-monospace, Menlo, monospace; padding:8px;
+             border:1px solid var(--line); border-radius:8px; background:var(--bg); color:var(--ink); }
+  .hidden { display:none; }
+</style>
+</head>
+<body>
+<main>
+  <section id="approve" class="hidden">
+    <h1>批准 Gateway 啟動</h1>
+    <p class="sub">確認下面的主機和版本是你要啟動的，再按指紋。</p>
+    <div class="card">
+      <dl>
+        <dt>主機</dt><dd id="f-host" class="big"></dd>
+        <dt>到期</dt><dd id="f-exp" class="big"></dd>
+        <dt>版本</dt><dd id="f-man"></dd>
+        <dt>編號</dt><dd id="f-nonce"></dd>
+      </dl>
+    </div>
+    <button id="btn-approve">用指紋批准</button>
+    <div id="approve-msg" class="msg"></div>
+  </section>
+
+  <section id="register" class="hidden">
+    <h1>註冊批准金鑰</h1>
+    <p class="sub">只做一次。完成後把下面的文字整段交給 Launcher 登記。</p>
+    <button id="btn-register">建立通行金鑰</button>
+    <div id="register-msg" class="msg"></div>
+    <textarea id="register-out" class="hidden" readonly></textarea>
+  </section>
+
+  <section id="invalid" class="hidden">
+    <h1>連結無效</h1>
+    <p class="sub" id="invalid-why"></p>
+  </section>
+</main>
+<script>
+"use strict";
+const b64u = {
+  enc(buf) {
+    const b = new Uint8Array(buf); let s = "";
+    for (let i = 0; i < b.length; i++) s += String.fromCharCode(b[i]);
+    return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  },
+  dec(str) {
+    const s = str.replace(/-/g, "+").replace(/_/g, "/");
+    const bin = atob(s + "===".slice((s.length + 3) % 4));
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+};
+const show = id => document.getElementById(id).classList.remove("hidden");
+const $ = id => document.getElementById(id);
+const setMsg = (id, text, cls) => { const el = $(id); el.textContent = text; el.className = "msg " + (cls || ""); };
+
+// Approval text must match the launcher's exact canonical format.
+const LINE_RE = /^xj-boot-approval v1\nhost=([A-Za-z0-9._-]{1,64})\nmanifest_sha256=([0-9a-f]{64})\nnonce=([0-9a-f]{32})\nexpires_unix=([0-9]{10})\n$/;
+
+function parseFragment() {
+  const p = new URLSearchParams(location.hash.slice(1));
+  return { mode: p.get("m"), a: p.get("a"), relay: p.get("r") };
+}
+
+async function approveFlow(aParam, relay) {
+  let bytes, text, m;
+  try {
+    bytes = b64u.dec(aParam);
+    text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    m = LINE_RE.exec(text);
+  } catch (e) { m = null; }
+  if (!m) { $("invalid-why").textContent = "批准內容格式不對，請不要按指紋。"; show("invalid"); return; }
+  if (!relay || !/^https:\/\/|^http:\/\/localhost[:/]/.test(relay)) {
+    $("invalid-why").textContent = "缺少回傳位址。"; show("invalid"); return;
+  }
+  const [, host, manifest, nonce, expires] = m;
+  const exp = new Date(Number(expires) * 1000);
+  $("f-host").textContent = host;
+  $("f-exp").textContent = exp.toLocaleString("zh-TW", { hour12: false });
+  $("f-man").textContent = manifest;
+  $("f-nonce").textContent = nonce;
+  show("approve");
+  if (exp.getTime() <= Date.now()) {
+    $("btn-approve").disabled = true;
+    setMsg("approve-msg", "這個批准已過期，請重新產生。", "bad");
+    return;
+  }
+  $("btn-approve").addEventListener("click", async () => {
+    $("btn-approve").disabled = true;
+    setMsg("approve-msg", "等待指紋…");
+    try {
+      const challenge = await crypto.subtle.digest("SHA-256", bytes);
+      const cred = await navigator.credentials.get({
+        publicKey: { challenge, rpId: location.hostname, userVerification: "required", timeout: 120000 }
+      });
+      const r = cred.response;
+      const payload = {
+        v: 1,
+        nonce,
+        approval: b64u.enc(bytes),
+        credential_id: b64u.enc(cred.rawId),
+        authenticator_data: b64u.enc(r.authenticatorData),
+        client_data_json: b64u.enc(r.clientDataJSON),
+        signature: b64u.enc(r.signature)
+      };
+      const res = await fetch(relay, { method: "POST", body: JSON.stringify(payload) });
+      if (!res.ok) throw new Error("回傳失敗 HTTP " + res.status);
+      setMsg("approve-msg", "已批准並送出。可以關閉這個頁面。", "ok");
+    } catch (e) {
+      $("btn-approve").disabled = false;
+      setMsg("approve-msg", "沒有批准：" + (e && e.message ? e.message : e), "bad");
+    }
+  });
+}
+
+async function registerFlow() {
+  show("register");
+  $("btn-register").addEventListener("click", async () => {
+    $("btn-register").disabled = true;
+    setMsg("register-msg", "等待指紋…");
+    try {
+      const cred = await navigator.credentials.create({
+        publicKey: {
+          rp: { name: "XJ Boot", id: location.hostname },
+          user: { id: crypto.getRandomValues(new Uint8Array(16)), name: "owner", displayName: "Owner" },
+          challenge: crypto.getRandomValues(new Uint8Array(32)),
+          pubKeyCredParams: [{ type: "public-key", alg: -7 }],
+          authenticatorSelection: { userVerification: "required", residentKey: "preferred" },
+          attestation: "none",
+          timeout: 120000
+        }
+      });
+      const spki = cred.response.getPublicKey && cred.response.getPublicKey();
+      if (!spki) throw new Error("這個瀏覽器無法匯出公鑰");
+      if (cred.response.getPublicKeyAlgorithm() !== -7) throw new Error("金鑰演算法不是 ES256");
+      const out = {
+        v: 1,
+        label: "owner-" + new Date().toISOString().slice(0, 10),
+        rp_id: location.hostname,
+        origin: location.origin,
+        credential_id: b64u.enc(cred.rawId),
+        alg: -7,
+        public_key_spki: b64u.enc(spki)
+      };
+      $("register-out").value = JSON.stringify(out);
+      show("register-out");
+      setMsg("register-msg", "完成。把下面整段文字交給 Launcher 登記（這是公鑰，可以公開）。", "ok");
+    } catch (e) {
+      $("btn-register").disabled = false;
+      setMsg("register-msg", "沒有完成：" + (e && e.message ? e.message : e), "bad");
+    }
+  });
+}
+
+const f = parseFragment();
+if (!window.PublicKeyCredential) { $("invalid-why").textContent = "這個瀏覽器不支援通行金鑰。"; show("invalid"); }
+else if (f.mode === "register") registerFlow();
+else if (f.a) approveFlow(f.a, f.relay);
+else { $("invalid-why").textContent = "缺少批准內容。"; show("invalid"); }
+</script>
+</body>
+</html>
