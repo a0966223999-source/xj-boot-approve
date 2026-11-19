@@ -14,7 +14,9 @@ Commands:
   clear-stop                remove STOP (Owner action on the host)
   add-key FILE              register a passkey public key produced by the approval page
 
-A standing grant is bound to this host and this exact manifest: any code change voids it.
+The approved "version" is the manifest file plus the exact start command, and every file the
+manifest lists ("<sha256>  <path>" per line, relative paths resolved against manifest_root) is
+re-hashed on every request and every start: any code change voids the approval.
 Every state-changing step runs under one exclusive flock (state_dir/boot.lock),
 shared by start, stop and revoke, so STOP is always checked right before the start.
 """
@@ -51,7 +53,9 @@ FLAG_UP, FLAG_UV = 0x01, 0x04
 
 
 class Deny(Exception):
-    pass
+    def __init__(self, reason, **detail):
+        super().__init__(reason)
+        self.detail = detail
 
 
 def b64u_dec(s):
@@ -85,6 +89,38 @@ def sha256_file(path):
         for chunk in iter(lambda: f.read(1 << 16), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+MANIFEST_LINE_RE = re.compile(r"^([0-9a-f]{64})  (\S.*)$")
+
+
+def verify_manifest_files(cfg):
+    """Re-hash every file listed in the manifest; refuse if any differs or is missing."""
+    root = cfg.get("manifest_root") or os.path.dirname(os.path.abspath(cfg["manifest_path"]))
+    try:
+        with open(cfg["manifest_path"], encoding="utf-8") as f:
+            lines = [ln.rstrip("\n") for ln in f]
+    except (OSError, UnicodeDecodeError):
+        raise Deny("MANIFEST_UNREADABLE")
+    entries = 0
+    for ln in lines:
+        if not ln.strip():
+            continue
+        m = MANIFEST_LINE_RE.match(ln)
+        if not m:
+            raise Deny("MANIFEST_FORMAT", line=ln[:200])
+        want, rel = m.group(1), m.group(2)
+        path = rel if os.path.isabs(rel) else os.path.join(root, rel)
+        try:
+            got = sha256_file(path)
+        except OSError:
+            raise Deny("CODE_MISSING", path=rel)
+        if got != want:
+            raise Deny("CODE_CHANGED", path=rel, expected=want, actual=got)
+        entries += 1
+    if entries == 0:
+        raise Deny("MANIFEST_EMPTY")
+    return entries
 
 
 def binding_sha256(cfg):
@@ -179,6 +215,7 @@ def cmd_request(cfg, ttl, standing_days=None):
     ttl = int(ttl or cfg["max_ttl_seconds"])
     if not 30 <= ttl <= cfg["max_ttl_seconds"]:
         raise SystemExit(f"ttl must be 30..{cfg['max_ttl_seconds']}")
+    verify_manifest_files(cfg)  # never ask the Owner to approve code that does not match its manifest
     nonce = secrets.token_hex(16)
     now = int(time.time())
     manifest = binding_sha256(cfg)
@@ -378,6 +415,7 @@ def check_binding(cfg, fields):
         raise Deny("HOST_MISMATCH")
     if fields["manifest_sha256"] != binding_sha256(cfg):
         raise Deny("MANIFEST_CHANGED")
+    verify_manifest_files(cfg)
 
 
 def spawn(cfg):
@@ -528,7 +566,11 @@ def cmd_status(cfg):
          "manifest_sha256": rec.get("manifest_sha256"),
          "grant_until_unix": rec.get("grant_until_unix"),
          "active": bool(rec.get("grant_until_unix", 0) > time.time())})
-    out("STATUS", stop=os.path.exists(os.path.join(cfg["state_dir"], "STOP")),
+    try:
+        code = {"ok": True, "files": verify_manifest_files(cfg)}
+    except Deny as e:
+        code = {"ok": False, "reason": str(e), **e.detail}
+    out("STATUS", stop=os.path.exists(os.path.join(cfg["state_dir"], "STOP")), code=code,
         pid=pid, running=bool(pid and pid_alive(pid)), standing_grant=grant,
         keys=[{"label": k.get("label"), "fingerprint": key_fingerprint(b64u_dec(k["public_key_spki"]))}
               for k in load_keys(cfg).values()])
@@ -576,7 +618,7 @@ def main(argv=None):
         elif a.cmd == "add-key":
             cmd_add_key(cfg, a.file)
     except Deny as e:
-        out("DENY", reason=str(e))
+        out("DENY", reason=str(e), **e.detail)
         return 2
     return 0
 

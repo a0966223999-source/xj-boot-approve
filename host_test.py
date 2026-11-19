@@ -76,11 +76,28 @@ class SoftAuthenticator:
 
 
 WORK = tempfile.mkdtemp(prefix="xjboot-host-")
+os.makedirs(os.path.join(WORK, "code", "pkg"))
+CODE_A = os.path.join(WORK, "code", "app.py")
+CODE_B = os.path.join(WORK, "code", "pkg", "lib.py")
+with open(CODE_A, "w") as f:
+    f.write("print('gateway app v1')\n")
+with open(CODE_B, "w") as f:
+    f.write("VALUE = 1\n")
 manifest = os.path.join(WORK, "MANIFEST")
-with open(manifest, "w") as f:
-    f.write("gateway build 1\n")
+
+
+def write_manifest(extra=""):
+    with open(manifest, "w") as f:
+        for rel in ("code/app.py", "code/pkg/lib.py"):
+            f.write("%s  %s\n" % (hashlib.sha256(open(os.path.join(WORK, rel), "rb").read()).hexdigest(), rel))
+        f.write(extra)
+
+
+write_manifest()
+GOOD_MANIFEST = open(manifest).read()
 cfg = {
     "rp_id": RP_ID, "origin": ORIGIN, "host": "gateway-host-test", "manifest_path": manifest,
+    "manifest_root": WORK,
     "start_cmd": [sys.executable, "-c", "import time; time.sleep(600)"],
     "state_dir": os.path.join(WORK, "state"), "trusted_keys": os.path.join(WORK, "trusted_keys.json"),
     "page_url": ORIGIN + "/xj-boot-approve/", "relay_post": "http://localhost:9/unused",
@@ -173,11 +190,20 @@ check("challenge of other text -> deny",
 stranger = SoftAuthenticator("stranger")
 check("unregistered key -> deny", start_with(stranger.assertion(t4, n4), n4).get("reason"), "UNKNOWN_KEY")
 
-with open(manifest, "w") as f:
-    f.write("gateway build 2 (changed)\n")
-check("manifest changed -> deny", start_with(good, n4).get("reason"), "MANIFEST_CHANGED")
-with open(manifest, "w") as f:
-    f.write("gateway build 1\n")
+with open(CODE_B, "w") as f:
+    f.write("VALUE = 2  # edited, manifest untouched\n")
+check("code edited, manifest untouched -> deny", start_with(good, n4).get("reason"), "CODE_CHANGED")
+check("request refused while code differs from manifest", xj("request").get("reason"), "CODE_CHANGED")
+st_bad = xj("status")["code"]
+check("status reports changed file", (st_bad["ok"], st_bad.get("path")), (False, "code/pkg/lib.py"))
+with open(CODE_B, "w") as f:
+    f.write("VALUE = 1\n")
+os.rename(CODE_A, CODE_A + ".gone")
+check("listed code file deleted -> deny", start_with(good, n4).get("reason"), "CODE_MISSING")
+os.rename(CODE_A + ".gone", CODE_A)
+write_manifest(extra="%s  code/new_module.py\n" % ("0" * 64))
+check("manifest file edited -> deny", start_with(good, n4).get("reason"), "MANIFEST_CHANGED")
+open(manifest, "w").write(GOOD_MANIFEST)
 CFG_B = os.path.join(WORK, "b.json"); json.dump(dict(cfg, host="other-host"), open(CFG_B, "w"))
 check("host mismatch -> deny", start_with(good, n4, cfgpath=CFG_B).get("reason"), "HOST_MISMATCH")
 check("valid approval still usable after denials", start_with(good, n4)["result"], "PASS")
@@ -246,11 +272,17 @@ check("restart again after clear-stop -> PASS", r["result"], "PASS")
 check("standing approval nonce cannot be claimed twice",
       start_with(owner.assertion(st1, s1), s1).get("reason"), "REPLAY")
 
-with open(manifest, "w") as f:
-    f.write("gateway build 3 (code changed)\n")
-check("code changed -> standing grant void", start_standing().get("reason"), "MANIFEST_CHANGED")
-with open(manifest, "w") as f:
-    f.write("gateway build 1\n")
+with open(CODE_A, "w") as f:
+    f.write("print('gateway app v2 - silently changed')\n")
+check("code edited, manifest untouched -> standing grant refused", start_standing().get("reason"), "CODE_CHANGED")
+with open(CODE_A, "w") as f:
+    f.write("print('gateway app v1')\n")
+with open(manifest, "a") as f:
+    f.write("%s  code/pkg/lib.py\n" % hashlib.sha256(b"VALUE = 1\n").hexdigest())
+check("manifest file edited -> standing grant void", start_standing().get("reason"), "MANIFEST_CHANGED")
+open(manifest, "w").write(GOOD_MANIFEST)
+check("code restored to approved version -> standing start PASS", start_standing()["result"], "PASS")
+reset()
 CFG_C = os.path.join(WORK, "c.json")
 json.dump(dict(cfg, start_cmd=[sys.executable, "-c", "print('swapped program')"]), open(CFG_C, "w"))
 check("start command changed -> standing grant void",

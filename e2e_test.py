@@ -43,11 +43,14 @@ PORT = srv.server_address[1]
 threading.Thread(target=srv.serve_forever, daemon=True).start()
 ORIGIN = f"http://localhost:{PORT}"
 
+CODE = os.path.join(WORK, "app.py")
+open(CODE, "w").write("print('v1')\n")
 manifest = os.path.join(WORK, "manifest.txt")
-open(manifest, "w").write("gateway build 1\n")
+open(manifest, "w").write("%s  app.py\n" % hashlib.sha256(b"print('v1')\n").hexdigest())
+GOOD_MANIFEST = open(manifest).read()
 cfg = {
     "rp_id": "localhost", "origin": ORIGIN, "host": "gateway-test",
-    "manifest_path": manifest,
+    "manifest_path": manifest, "manifest_root": WORK,
     "start_cmd": [sys.executable, "-c", "import time; time.sleep(600)"],
     "state_dir": os.path.join(WORK, "state"),
     "trusted_keys": os.path.join(WORK, "trusted_keys.json"),
@@ -168,10 +171,10 @@ with sync_playwright() as pw:
           xj("start", "--nonce", n5, "--assertion-file", pf).get("reason"), "APPROVAL_TEXT_MISMATCH")
 
     # 8. manifest changed after approval
-    open(manifest, "w").write("gateway build 2 (changed)\n")
+    open(CODE, "w").write("print('v2 changed')\n")
     json.dump(good, open(pf, "w"))
-    check("manifest changed -> deny", xj("start", "--nonce", n4, "--assertion-file", pf).get("reason"), "MANIFEST_CHANGED")
-    open(manifest, "w").write("gateway build 1\n")
+    check("code changed -> deny", xj("start", "--nonce", n4, "--assertion-file", pf).get("reason"), "CODE_CHANGED")
+    open(CODE, "w").write("print('v1')\n")
 
     # 9. wrong host config
     cfg_b = dict(cfg, host="other-host"); CFG_B = os.path.join(WORK, "b.json"); json.dump(cfg_b, open(CFG_B, "w"))
