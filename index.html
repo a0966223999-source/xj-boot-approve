@@ -57,6 +57,26 @@
     <div id="approve-msg" class="msg"></div>
   </section>
 
+  <section id="ai" class="hidden">
+    <h1>批准 AI 任務</h1>
+    <p class="sub">確認下面是你要 AI 做的事，再按指紋。按一次只批准這一份計畫、這一次執行；內容被改過就會失效。</p>
+    <div class="card">
+      <dl>
+        <dt>申請者</dt><dd id="ai-req" class="big"></dd>
+        <dt>範圍</dt><dd id="ai-scope" class="big"></dd>
+        <dt>標題</dt><dd id="ai-title" class="big"></dd>
+        <dt>到期</dt><dd id="ai-exp" class="big"></dd>
+        <dt>編號</dt><dd id="ai-ticket"></dd>
+      </dl>
+    </div>
+    <div class="card">
+      <div class="sub" style="margin:0">計畫全文</div>
+      <pre id="ai-plan" style="white-space:pre-wrap;word-break:break-word;font:15px/1.6 system-ui,-apple-system,'Noto Sans TC',sans-serif;margin:8px 0 0"></pre>
+    </div>
+    <button id="btn-ai">用指紋批准這個 AI 任務</button>
+    <div id="ai-msg" class="msg"></div>
+  </section>
+
   <section id="register" class="hidden">
     <h1>註冊批准金鑰</h1>
     <p class="sub">只做一次。完成後把下面的文字整段交給 Launcher 登記。</p>
@@ -99,7 +119,7 @@ const fmt = d => d.toLocaleString("zh-TW", { hour12: false });
 
 function parseFragment() {
   const p = new URLSearchParams(location.hash.slice(1));
-  return { mode: p.get("m"), a: p.get("a"), relay: p.get("r") };
+  return { mode: p.get("m"), a: p.get("a"), relay: p.get("r"), plan: p.get("p") };
 }
 
 async function approveFlow(aParam, relay) {
@@ -173,6 +193,71 @@ async function approveFlow(aParam, relay) {
   });
 }
 
+// AI task approvals (Deer approval tickets). Different prefix from the Launcher's,
+// so neither side accepts the other's text. The signed result only ever goes to
+// the fixed Deer endpoint below, never to an address taken from the link.
+const AI_RE = /^xj-ai-approval v1\nticket=([0-9a-f]{32})\nrequester=([^\n]{1,80})\nscope=(code_pr|deploy|hub_write|other)\ntitle=([^\n]{1,160})\nplan_sha256=([0-9a-f]{64})\nexpires_unix=([0-9]{10})\n$/;
+const AI_RELAY = "https://ai-gateway-security-review-public-git-test-ver-e7ace3-yoyo-5560.vercel.app/api/approval/submit";
+const SCOPE_NAME = { code_pr: "寫程式並開 PR（不合併、不部署）", deploy: "部署", hub_write: "寫入 Hub", other: "其他" };
+const hex = buf => Array.from(new Uint8Array(buf), x => x.toString(16).padStart(2, "0")).join("");
+
+async function aiFlow(aParam, pParam) {
+  let bytes, planBytes, text, plan, m;
+  try {
+    bytes = b64u.dec(aParam);
+    planBytes = b64u.dec(pParam || "");
+    text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    plan = new TextDecoder("utf-8", { fatal: true }).decode(planBytes);
+    m = AI_RE.exec(text);
+  } catch (e) { m = null; }
+  if (!m) { $("invalid-why").textContent = "批准內容格式不對，請不要按指紋。"; show("invalid"); return; }
+  const [, ticket, requester, scope, title, planSha, expires] = m;
+  if (hex(await crypto.subtle.digest("SHA-256", planBytes)) !== planSha) {
+    $("invalid-why").textContent = "計畫內容和批准編號對不上，可能被改過，請不要按指紋。"; show("invalid"); return;
+  }
+  const exp = new Date(Number(expires) * 1000);
+  $("ai-req").textContent = requester;
+  $("ai-scope").textContent = SCOPE_NAME[scope] || scope;
+  $("ai-title").textContent = title;
+  $("ai-exp").textContent = fmt(exp);
+  $("ai-ticket").textContent = ticket;
+  $("ai-plan").textContent = plan;
+  show("ai");
+  if (exp.getTime() <= Date.now()) {
+    $("btn-ai").disabled = true;
+    setMsg("ai-msg", "這個申請已過期，請 AI 重新送出。", "bad");
+    return;
+  }
+  $("btn-ai").addEventListener("click", async () => {
+    $("btn-ai").disabled = true;
+    setMsg("ai-msg", "等待指紋…");
+    try {
+      const challenge = await crypto.subtle.digest("SHA-256", bytes);
+      const cred = await navigator.credentials.get({
+        publicKey: { challenge, rpId: location.hostname, userVerification: "required", timeout: 120000 }
+      });
+      const r = cred.response;
+      const payload = {
+        v: 1,
+        nonce: ticket,
+        approval: b64u.enc(bytes),
+        credential_id: b64u.enc(cred.rawId),
+        authenticator_data: b64u.enc(r.authenticatorData),
+        client_data_json: b64u.enc(r.clientDataJSON),
+        signature: b64u.enc(r.signature)
+      };
+      const res = await fetch(AI_RELAY, { method: "POST", body: JSON.stringify(payload) });
+      let body = {};
+      try { body = await res.json(); } catch (e) {}
+      if (!res.ok || !body.approved) throw new Error("Deer 拒絕：" + (body.error || ("HTTP " + res.status)));
+      setMsg("ai-msg", "已批准。AI 會在群聊回報進度，可以關閉這個頁面。", "ok");
+    } catch (e) {
+      $("btn-ai").disabled = false;
+      setMsg("ai-msg", "沒有批准：" + (e && e.message ? e.message : e), "bad");
+    }
+  });
+}
+
 async function registerFlow() {
   show("register");
   $("btn-register").addEventListener("click", async () => {
@@ -215,6 +300,7 @@ async function registerFlow() {
 const f = parseFragment();
 if (!window.PublicKeyCredential) { $("invalid-why").textContent = "這個瀏覽器不支援通行金鑰。"; show("invalid"); }
 else if (f.mode === "register") registerFlow();
+else if (f.mode === "ai" && f.a) aiFlow(f.a, f.plan);
 else if (f.a) approveFlow(f.a, f.relay);
 else { $("invalid-why").textContent = "缺少批准內容。"; show("invalid"); }
 </script>
