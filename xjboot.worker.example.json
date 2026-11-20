@@ -1,0 +1,17 @@
+{
+  "rp_id": "a0966223999-source.github.io",
+  "origin": "https://a0966223999-source.github.io",
+  "service": "worker",
+  "host": "<這台主機的實際 hostname>",
+  "manifest_path": "/path/to/worker-release/MANIFEST",
+  "manifest_root": "/path/to/repo",
+  "start_cmd": ["/path/to/start-worker.sh"],
+  "state_dir": "/home/<user>/.xj-boot-worker/state",
+  "trusted_keys": "/etc/xj-boot/trusted_keys.json",
+  "page_url": "https://a0966223999-source.github.io/xj-boot-approve/",
+  "relay_post": "https://ntfy.sh/<隨機長名稱-回傳>",
+  "relay_poll": "https://ntfy.sh/<隨機長名稱-回傳>/json?poll=1&since=15m",
+  "notify_url": "https://ntfy.sh/<隨機長名稱-通知>",
+  "max_ttl_seconds": 600,
+  "max_standing_days": 30
+}

@@ -8,7 +8,7 @@ and a one-bit change to it must be refused as BAD_SIGNATURE.
 
 Usage: python3 -I host_test.py /path/to/dir/with/xjboot.py
 """
-import base64, hashlib, json, os, re, secrets, shutil, struct, subprocess, sys, tempfile, time
+import base64, hashlib, json, os, re, secrets, shutil, socket, struct, subprocess, sys, tempfile, time
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -96,7 +96,7 @@ def write_manifest(extra=""):
 write_manifest()
 GOOD_MANIFEST = open(manifest).read()
 cfg = {
-    "rp_id": RP_ID, "origin": ORIGIN, "host": "gateway-host-test", "manifest_path": manifest,
+    "rp_id": RP_ID, "origin": ORIGIN, "host": socket.gethostname(), "manifest_path": manifest,
     "manifest_root": WORK,
     "start_cmd": [sys.executable, "-c", "import time; time.sleep(600)"],
     "state_dir": os.path.join(WORK, "state"), "trusted_keys": os.path.join(WORK, "trusted_keys.json"),
@@ -206,6 +206,7 @@ check("manifest file edited -> deny", start_with(good, n4).get("reason"), "MANIF
 open(manifest, "w").write(GOOD_MANIFEST)
 CFG_B = os.path.join(WORK, "b.json"); json.dump(dict(cfg, host="other-host"), open(CFG_B, "w"))
 check("host mismatch -> deny", start_with(good, n4, cfgpath=CFG_B).get("reason"), "HOST_MISMATCH")
+check("request on a machine whose hostname differs -> deny", xj("request", cfgpath=CFG_B).get("reason"), "HOSTNAME_MISMATCH")
 check("valid approval still usable after denials", start_with(good, n4)["result"], "PASS")
 reset()
 
@@ -303,9 +304,22 @@ open(GRANT, "w").write(good_grant)
 check("original grant file restored -> PASS", start_standing()["result"], "PASS")
 reset()
 
+# `check`: verify-only gate for a supervisor (no process started)
+chk = xj("check")
+check("check with valid grant -> PASS, nothing started", (chk["result"], chk.get("mode"), xj("status")["running"]), ("PASS", "check", False))
+with open(CODE_B, "w") as f:
+    f.write("VALUE = 3\n")
+check("check after code edit -> deny", xj("check").get("reason"), "CODE_CHANGED")
+with open(CODE_B, "w") as f:
+    f.write("VALUE = 1\n")
+xj("stop", "--grace", "1")
+check("check with STOP present -> deny", xj("check").get("reason"), "STOP_PRESENT")
+xj("clear-stop")
+check("check on another host config -> deny", xj("check", cfgpath=CFG_B).get("reason"), "HOST_MISMATCH")
 rv = xj("revoke")
 check("revoke removes grant", (rv["result"], rv.get("had_grant")), ("REVOKED", True))
 check("after revoke -> standing start denied", start_standing().get("reason"), "NO_STANDING_GRANT")
+check("check after revoke -> deny", xj("check").get("reason"), "NO_STANDING_GRANT")
 open(GRANT, "w").write(good_grant)
 check("restoring a revoked grant file -> deny", start_standing().get("reason"), "GRANT_REVOKED")
 os.unlink(GRANT)
@@ -342,6 +356,49 @@ r = start_with(owner.assertion(t9, n9), n9); reset()
 check("short standing grant: first start PASS", r["result"], "PASS")
 print("   waiting 40s for standing grant expiry…", flush=True); time.sleep(40)
 check("standing grant expired -> deny", start_standing().get("reason"), "STANDING_EXPIRED")
+
+# ---------------------------------------------------------------- v2.4 service label + real hostname
+print("--- v2.4 service label (worker) + real hostname ---", flush=True)
+xj("stop", "--grace", "3")
+wcfg = dict(cfg, service="worker", state_dir=os.path.join(WORK, "wstate"))
+CFG_W = os.path.join(WORK, "w.json"); json.dump(wcfg, open(CFG_W, "w"))
+WGRANT = os.path.join(wcfg["state_dir"], "standing_grant.json")
+check("service config refuses one-time request", xj("request", cfgpath=CFG_W)["result"], "CRASH")
+rw = xj("request", "--standing-days", "30", cfgpath=CFG_W)
+wn = rw["nonce"]; wt = open(os.path.join(wcfg["state_dir"], "pending", wn), "rb").read()
+check("worker request is v3 with service=worker",
+      (wt.split(b"\n")[0], wt.split(b"\n")[2]), (b"xj-boot-approval v3", b"service=worker"))
+r = start_with(owner.assertion(wt, wn), wn, cfgpath=CFG_W)
+check("worker standing approval: first start PASS", (r["result"], r.get("service")), ("PASS", "worker"))
+xj("stop", "--grace", "3", cfgpath=CFG_W); xj("clear-stop", cfgpath=CFG_W)
+cw = xj("check", cfgpath=CFG_W)
+owner_fp = xj("status")["keys"][0]["fingerprint"]
+check("worker check PASS with service and key fingerprint",
+      (cw["result"], cw.get("service"), cw.get("approved_by_fingerprint")), ("PASS", "worker", owner_fp))
+check("worker check started nothing", xj("status", cfgpath=CFG_W)["running"], False)
+CFG_WG = os.path.join(WORK, "wg.json"); json.dump(dict(wcfg, service="gateway"), open(CFG_WG, "w"))
+check("worker grant used by a gateway-labelled config -> deny",
+      xj("check", cfgpath=CFG_WG).get("reason"), "SERVICE_MISMATCH")
+CFG_WN = os.path.join(WORK, "wn.json"); json.dump({k: v for k, v in wcfg.items() if k != "service"}, open(CFG_WN, "w"))
+check("worker grant used by an unlabelled (v2) config -> deny",
+      xj("check", cfgpath=CFG_WN).get("reason"), "SERVICE_MISMATCH")
+wg = open(WGRANT).read(); g = json.loads(wg)
+swapped = unb64u(g["approval_b64"]).replace(b"service=worker", b"service=gateway")
+g["approval_b64"] = b64u(swapped); g["payload"]["approval"] = b64u(swapped)
+open(WGRANT, "w").write(json.dumps(g))
+check("grant file with service relabelled -> deny", xj("check", cfgpath=CFG_WG).get("reason"), "CHALLENGE_MISMATCH")
+open(WGRANT, "w").write(wg)
+if os.geteuid() == 0 and shutil.which("unshare"):
+    p = subprocess.run(["unshare", "-u", "sh", "-c", 'hostname copied-elsewhere && exec "$@"', "sh",
+                        sys.executable, "-I", os.path.join(SRC, "xjboot.py"), "--config", CFG_W, "check"],
+                       capture_output=True, text=True, timeout=60)
+    check("state copied to a machine with another hostname -> deny",
+          json.loads(p.stdout.strip().splitlines()[-1]).get("reason"), "HOSTNAME_MISMATCH")
+else:
+    print("   (skipped hostname-namespace test: needs root + unshare)")
+check("worker check still PASS after all denials", xj("check", cfgpath=CFG_W)["result"], "PASS")
+xj("revoke", cfgpath=CFG_W)
+check("worker check after revoke -> deny", xj("check", cfgpath=CFG_W).get("reason"), "NO_STANDING_GRANT")
 
 xj("stop", "--grace", "3")
 shutil.rmtree(WORK, ignore_errors=True)

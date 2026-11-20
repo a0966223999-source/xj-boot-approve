@@ -1,5 +1,5 @@
 """End-to-end test of xjboot with a real WebAuthn flow in Chromium (CDP virtual authenticator)."""
-import base64, hashlib, json, os, shutil, subprocess, sys, tempfile, threading, time
+import base64, hashlib, json, os, shutil, socket, subprocess, sys, tempfile, threading, time
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from playwright.sync_api import sync_playwright
 
@@ -49,7 +49,7 @@ manifest = os.path.join(WORK, "manifest.txt")
 open(manifest, "w").write("%s  app.py\n" % hashlib.sha256(b"print('v1')\n").hexdigest())
 GOOD_MANIFEST = open(manifest).read()
 cfg = {
-    "rp_id": "localhost", "origin": ORIGIN, "host": "gateway-test",
+    "rp_id": "localhost", "origin": ORIGIN, "host": socket.gethostname(),
     "manifest_path": manifest, "manifest_root": WORK,
     "start_cmd": [sys.executable, "-c", "import time; time.sleep(600)"],
     "state_dir": os.path.join(WORK, "state"),
@@ -245,6 +245,22 @@ with sync_playwright() as pw:
     xj("stop", "--grace", "3"); xj("clear-stop")
     check("restart under standing grant -> PASS", xj("start", "--standing")["result"], "PASS")
     xj("stop", "--grace", "3")
+
+    # 18-21 v2.4: a worker-labelled standing approval through the real page
+    wcfg = dict(cfg, service="worker", state_dir=os.path.join(WORK, "wstate"))
+    CFG_W = os.path.join(WORK, "w.json"); json.dump(wcfg, open(CFG_W, "w"))
+    rqw = xj("request", "--standing-days", "30", cfgpath=CFG_W); nw = rqw["nonce"]
+    page.goto("about:blank"); page.goto(rqw["url"])
+    check("page title names the service", page.text_content("#approve h1"), "批准 Worker 長期授權")
+    check("page shows service row", (page.is_visible("#f-svc"), page.text_content("#f-svc")), (True, "Worker"))
+    page.click("#btn-approve")
+    page.wait_for_function("document.getElementById('approve-msg').textContent.includes('已批准')", timeout=15000)
+    stw = xj("start", "--nonce", nw, "--wait", "10", cfgpath=CFG_W)
+    check("worker approval via real WebAuthn -> PASS", (stw["result"], stw.get("service")), ("PASS", "worker"))
+    xj("stop", "--grace", "3", cfgpath=CFG_W); xj("clear-stop", cfgpath=CFG_W)
+    check("worker check -> PASS", xj("check", cfgpath=CFG_W).get("service"), "worker")
+    page.goto("about:blank"); page.goto(rqs["url"])
+    check("legacy v2 link shows unlabelled service", page.text_content("#f-svc"), "未標示（舊格式，Gateway）")
 
     browser.close()
 

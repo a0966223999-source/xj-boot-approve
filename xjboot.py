@@ -9,10 +9,19 @@ Commands:
   start --standing          start again under the active standing grant, no new fingerprint;
                             the stored Owner signature is re-verified on every start
   stop                      write STOP and terminate the running service
+  check                     verify only (no start): STOP absent, standing grant valid, Owner
+                            signature re-verified, host/version/every listed file unchanged.
+                            Exit 0 = PASS. For a supervisor (e.g. Manager) to call before it
+                            hands a child its maintenance authority.
   revoke                    delete the active standing grant
   status                    show STOP / running / standing grant state
   clear-stop                remove STOP (Owner action on the host)
   add-key FILE              register a passkey public key produced by the approval page
+
+v2.4: a config with "service" (e.g. "worker") issues standing approvals in format v3, which
+carries service=<name> so the Owner's phone shows which service is being approved; such a
+config only accepts a grant for the same service. The config "host" must equal the machine's
+real hostname (checked on request, start and check), so a copied state dir is useless elsewhere.
 
 The approved "version" is the manifest file plus the exact start command, and every file the
 manifest lists ("<sha256>  <path>" per line, relative paths resolved against manifest_root) is
@@ -29,6 +38,7 @@ import os
 import re
 import secrets
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -48,6 +58,12 @@ APPROVAL_RE_V2 = re.compile(
     rb"^xj-boot-approval v2\nmode=standing\nhost=([A-Za-z0-9._-]{1,64})\nmanifest_sha256=([0-9a-f]{64})\n"
     rb"nonce=([0-9a-f]{32})\nsign_by_unix=([0-9]{10})\ngrant_until_unix=([0-9]{10})\n\Z"
 )
+APPROVAL_RE_V3 = re.compile(
+    rb"^xj-boot-approval v3\nmode=standing\nservice=([a-z0-9-]{1,32})\nhost=([A-Za-z0-9._-]{1,64})\n"
+    rb"manifest_sha256=([0-9a-f]{64})\nnonce=([0-9a-f]{32})\nsign_by_unix=([0-9]{10})\n"
+    rb"grant_until_unix=([0-9]{10})\n\Z"
+)
+SERVICE_RE = re.compile(r"^[a-z0-9-]{1,32}$")
 NONCE_RE = re.compile(r"^[0-9a-f]{32}$")
 FLAG_UP, FLAG_UV = 0x01, 0x04
 
@@ -77,6 +93,8 @@ def load_config(path):
             raise SystemExit(f"config missing {k}")
     cfg.setdefault("max_ttl_seconds", 600)
     cfg.setdefault("max_standing_days", 30)
+    if "service" in cfg and not SERVICE_RE.match(str(cfg["service"])):
+        raise SystemExit("config service must match [a-z0-9-]{1,32}")
     os.makedirs(os.path.join(cfg["state_dir"], "pending"), mode=0o700, exist_ok=True)
     os.makedirs(os.path.join(cfg["state_dir"], "used"), mode=0o700, exist_ok=True)
     os.makedirs(os.path.join(cfg["state_dir"], "revoked"), mode=0o700, exist_ok=True)
@@ -215,11 +233,14 @@ def cmd_request(cfg, ttl, standing_days=None):
     ttl = int(ttl or cfg["max_ttl_seconds"])
     if not 30 <= ttl <= cfg["max_ttl_seconds"]:
         raise SystemExit(f"ttl must be 30..{cfg['max_ttl_seconds']}")
+    check_hostname(cfg)
     verify_manifest_files(cfg)  # never ask the Owner to approve code that does not match its manifest
     nonce = secrets.token_hex(16)
     now = int(time.time())
     manifest = binding_sha256(cfg)
     if standing_days is None:
+        if cfg.get("service"):
+            raise SystemExit("a config with service uses standing approvals only (--standing-days)")
         text = (
             "xj-boot-approval v1\n"
             f"host={cfg['host']}\n"
@@ -233,17 +254,19 @@ def cmd_request(cfg, ttl, standing_days=None):
         days = int(standing_days)
         if not 1 <= days <= cfg["max_standing_days"]:
             raise SystemExit(f"standing days must be 1..{cfg['max_standing_days']}")
+        svc = cfg.get("service")
         text = (
-            "xj-boot-approval v2\n"
-            "mode=standing\n"
-            f"host={cfg['host']}\n"
+            ("xj-boot-approval v3\n" if svc else "xj-boot-approval v2\n")
+            + "mode=standing\n"
+            + (f"service={svc}\n" if svc else "")
+            + f"host={cfg['host']}\n"
             f"manifest_sha256={manifest}\n"
             f"nonce={nonce}\n"
             f"sign_by_unix={now + ttl}\n"
             f"grant_until_unix={now + days * 86400}\n"
         ).encode()
-        assert APPROVAL_RE_V2.match(text)
-        note = f"{cfg['host']} 等你批准長期授權 {days} 天"
+        assert (APPROVAL_RE_V3 if svc else APPROVAL_RE_V2).match(text)
+        note = f"{cfg['host']} {svc or ''} 等你批准長期授權 {days} 天".replace("  ", " ")
     create_exclusive(os.path.join(cfg["state_dir"], "pending", nonce), text)
     frag = urllib.parse.urlencode({"a": b64u_enc(text), "r": cfg["relay_post"]})
     url = f"{cfg['page_url']}#{frag}"
@@ -272,7 +295,8 @@ def verify_assertion(cfg, keys, pending_text, payload):
         raise Deny("APPROVAL_TEXT_MISMATCH")
     m = APPROVAL_RE.match(pending_text)
     m2 = None if m else APPROVAL_RE_V2.match(pending_text)
-    if not (m or m2):
+    m3 = None if (m or m2) else APPROVAL_RE_V3.match(pending_text)
+    if not (m or m2 or m3):
         raise Deny("APPROVAL_FORMAT")
     key = keys.get(payload.get("credential_id"))
     if key is None:
@@ -305,6 +329,7 @@ def verify_assertion(cfg, keys, pending_text, payload):
     if not flags & FLAG_UV:
         raise Deny("USER_NOT_VERIFIED")
 
+    fp = key_fingerprint(b64u_dec(key["public_key_spki"]))
     pub = serialization.load_der_public_key(b64u_dec(key["public_key_spki"]))
     signed = auth + hashlib.sha256(cdj_raw).digest()
     try:
@@ -314,11 +339,16 @@ def verify_assertion(cfg, keys, pending_text, payload):
     if m:
         host, manifest, nonce, expires = (g.decode() for g in m.groups())
         return {"mode": "once", "host": host, "manifest_sha256": manifest, "nonce": nonce,
-                "expires_unix": int(expires), "key": key.get("label")}
-    host, manifest, nonce, sign_by, grant_until = (g.decode() for g in m2.groups())
+                "expires_unix": int(expires), "key": key.get("label"), "key_fingerprint": fp}
+    if m3:
+        service, host, manifest, nonce, sign_by, grant_until = (g.decode() for g in m3.groups())
+    else:
+        service = None
+        host, manifest, nonce, sign_by, grant_until = (g.decode() for g in m2.groups())
     # expires_unix = deadline for the first claim of the signed request
-    return {"mode": "standing", "host": host, "manifest_sha256": manifest, "nonce": nonce,
-            "expires_unix": int(sign_by), "grant_until_unix": int(grant_until), "key": key.get("label")}
+    return {"mode": "standing", "service": service, "host": host, "manifest_sha256": manifest,
+            "nonce": nonce, "expires_unix": int(sign_by), "grant_until_unix": int(grant_until),
+            "key": key.get("label"), "key_fingerprint": fp}
 
 
 def poll_relay(cfg, nonce, wait):
@@ -405,14 +435,24 @@ def cmd_start(cfg, nonce, assertion_file, wait):
         if fields["mode"] == "standing":
             write_grant(cfg, pending_text, payload, fields, now)
         pid = spawn(cfg)
-    extra = {} if fields["mode"] == "once" else {"standing_grant_until_unix": fields["grant_until_unix"]}
+    extra = {} if fields["mode"] == "once" else {"standing_grant_until_unix": fields["grant_until_unix"],
+                                                 "service": fields.get("service")}
     out("PASS", started_pid=pid, approved_by=fields["key"], nonce=nonce, mode=fields["mode"],
         manifest_sha256=fields["manifest_sha256"], **extra)
+
+
+def check_hostname(cfg):
+    actual = socket.gethostname()
+    if actual != cfg["host"]:
+        raise Deny("HOSTNAME_MISMATCH", expected=cfg["host"], actual=actual)
 
 
 def check_binding(cfg, fields):
     if fields["host"] != cfg["host"]:
         raise Deny("HOST_MISMATCH")
+    if fields.get("service") != cfg.get("service"):
+        raise Deny("SERVICE_MISMATCH", expected=cfg.get("service"), signed=fields.get("service"))
+    check_hostname(cfg)
     if fields["manifest_sha256"] != binding_sha256(cfg):
         raise Deny("MANIFEST_CHANGED")
     verify_manifest_files(cfg)
@@ -476,36 +516,52 @@ def load_grant(cfg):
         raise Deny("GRANT_CORRUPT")
 
 
+def _standing_checks(cfg, keys):
+    """All standing-grant checks; returns verified fields. Caller holds boot_lock."""
+    state = cfg["state_dir"]
+    if os.path.exists(os.path.join(state, "STOP")):
+        raise Deny("STOP_PRESENT")
+    rec = load_grant(cfg)
+    if rec is None:
+        raise Deny("NO_STANDING_GRANT")
+    try:
+        pending_text = b64u_dec(rec["approval_b64"])
+        payload = rec["payload"]
+    except (KeyError, TypeError):
+        raise Deny("GRANT_CORRUPT")
+    fields = verify_assertion(cfg, keys, pending_text, payload)
+    if fields["mode"] != "standing":
+        raise Deny("NOT_STANDING")
+    if not os.path.exists(os.path.join(state, "used", fields["nonce"])):
+        raise Deny("GRANT_NOT_CLAIMED")
+    if os.path.exists(os.path.join(state, "revoked", fields["nonce"])):
+        raise Deny("GRANT_REVOKED")
+    if fields["grant_until_unix"] <= time.time():
+        raise Deny("STANDING_EXPIRED")
+    check_binding(cfg, fields)
+    return fields
+
+
+def cmd_check(cfg):
+    keys = load_keys(cfg)
+    with boot_lock(cfg):
+        fields = _standing_checks(cfg, keys)
+    out("PASS", mode="check", host=fields["host"], service=fields.get("service"), nonce=fields["nonce"],
+        approved_by=fields["key"], approved_by_fingerprint=fields["key_fingerprint"],
+        manifest_sha256=fields["manifest_sha256"], standing_grant_until_unix=fields["grant_until_unix"])
+
+
 def cmd_start_standing(cfg):
     keys = load_keys(cfg)
     with boot_lock(cfg):
-        state = cfg["state_dir"]
-        if os.path.exists(os.path.join(state, "STOP")):
-            raise Deny("STOP_PRESENT")
-        rec = load_grant(cfg)
-        if rec is None:
-            raise Deny("NO_STANDING_GRANT")
-        try:
-            pending_text = b64u_dec(rec["approval_b64"])
-            payload = rec["payload"]
-        except (KeyError, TypeError):
-            raise Deny("GRANT_CORRUPT")
         # the grant file is only a cache: the Owner's signature is verified again every time
-        fields = verify_assertion(cfg, keys, pending_text, payload)
-        if fields["mode"] != "standing":
-            raise Deny("NOT_STANDING")
-        if not os.path.exists(os.path.join(state, "used", fields["nonce"])):
-            raise Deny("GRANT_NOT_CLAIMED")
-        if os.path.exists(os.path.join(state, "revoked", fields["nonce"])):
-            raise Deny("GRANT_REVOKED")
-        if fields["grant_until_unix"] <= time.time():
-            raise Deny("STANDING_EXPIRED")
-        check_binding(cfg, fields)
+        fields = _standing_checks(cfg, keys)
         old = read_pid(cfg)
         if old and pid_alive(old):
             raise Deny("ALREADY_RUNNING")
         pid = spawn(cfg)
     out("PASS", started_pid=pid, approved_by=fields["key"], nonce=fields["nonce"], mode="standing",
+        service=fields.get("service"),
         manifest_sha256=fields["manifest_sha256"], standing_grant_until_unix=fields["grant_until_unix"])
 
 
@@ -570,7 +626,7 @@ def cmd_status(cfg):
         code = {"ok": True, "files": verify_manifest_files(cfg)}
     except Deny as e:
         code = {"ok": False, "reason": str(e), **e.detail}
-    out("STATUS", stop=os.path.exists(os.path.join(cfg["state_dir"], "STOP")), code=code,
+    out("STATUS", service=cfg.get("service"), hostname_ok=socket.gethostname() == cfg["host"], stop=os.path.exists(os.path.join(cfg["state_dir"], "STOP")), code=code,
         pid=pid, running=bool(pid and pid_alive(pid)), standing_grant=grant,
         keys=[{"label": k.get("label"), "fingerprint": key_fingerprint(b64u_dec(k["public_key_spki"]))}
               for k in load_keys(cfg).values()])
@@ -597,6 +653,7 @@ def main(argv=None):
     s.add_argument("--assertion-file"); s.add_argument("--wait", type=int, default=300)
     t = sub.add_parser("stop"); t.add_argument("--grace", type=float, default=10)
     sub.add_parser("status"); sub.add_parser("clear-stop"); sub.add_parser("revoke")
+    sub.add_parser("check")
     k = sub.add_parser("add-key"); k.add_argument("file")
     a = ap.parse_args(argv)
     cfg = load_config(a.config)
@@ -609,6 +666,8 @@ def main(argv=None):
             cmd_start(cfg, a.nonce, a.assertion_file, a.wait)
         elif a.cmd == "revoke":
             cmd_revoke(cfg)
+        elif a.cmd == "check":
+            cmd_check(cfg)
         elif a.cmd == "stop":
             cmd_stop(cfg, a.grace)
         elif a.cmd == "status":
